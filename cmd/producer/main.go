@@ -3,45 +3,28 @@ package main
 import (
 	"context"
 	"log"
-	"os"
-	"os/signal"
-	"syscall"
 
 	"github.com/Guizzs26/real_time_voting_analysis_system/internal/event"
 	"github.com/Guizzs26/real_time_voting_analysis_system/internal/simulation"
 )
 
 func main() {
-	kBrokers := []string{"localhost:9092"}
+	kafkaBrokers := []string{"localhost:9092"}
 	topic := "votes"
+	concurrency := 50    // 50 goroutines publishing in parallel
+	totalVotes := 100000 // 100,000 votes in total
 
-	kp, err := event.NewKafkaPublisher(kBrokers, topic)
+	log.Println("Starting Producer in stress test mode...")
+
+	publisher, err := event.NewKafkaPublisher(kafkaBrokers, topic)
 	if err != nil {
-		log.Fatalf("failed to create kafka publisher: %v", err)
+		log.Fatalf("Error creating Kafka publisher: %v", err)
 	}
-	defer kp.Close()
+	defer publisher.Close()
 
-	sim := simulation.New(kp)
+	sim := simulation.New(publisher, concurrency, totalVotes)
 
-	mainCtx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	signalChan := make(chan os.Signal, 1)
-	signal.Notify(signalChan, os.Interrupt, syscall.SIGTERM)
-
-	go func() {
-		if err := sim.Run(mainCtx); err != nil {
-			log.Printf("Error while running simulator: %v", err)
-		}
-	}()
-
-	// `main` now hangs here, waiting for a shutdown signal
-	log.Println("Producer is running. Press Ctrl+C to exit")
-	<-signalChan
-
-	// Upon receiving the signal, we cancel the context, which will cause sim.Run() to stop
-	log.Println("Shutdown signal received, stopping the producer...")
-	cancel()
-
-	log.Println("Producer terminated")
+	if err := sim.Run(context.Background()); err != nil {
+		log.Fatalf("Error during stress test: %v", err)
+	}
 }

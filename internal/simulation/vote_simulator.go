@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"sync"
 	"time"
 
 	"github.com/Guizzs26/real_time_voting_analysis_system/internal/event"
@@ -13,57 +14,61 @@ import (
 
 type Simulator struct {
 	eventPublisher event.VotePublisher
+	concurrency    int
+	totalVotes     int
 }
 
-func New(ep event.VotePublisher) *Simulator {
-	return &Simulator{eventPublisher: ep}
+func New(ep event.VotePublisher, c, tv int) *Simulator {
+	return &Simulator{eventPublisher: ep,
+		concurrency: c,
+		totalVotes:  tv,
+	}
 }
 
 func (s *Simulator) Run(ctx context.Context) error {
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
+	log.Printf("Starting stress test: %d votes with %d parallel workers...", s.totalVotes, s.concurrency)
 
-	const fraudFrequency = 5
-	var fraudCounter int
-	var lastLegitUserID string
-	var lastLegitPollID string
+	var wg sync.WaitGroup
+	jobs := make(chan struct{}, s.totalVotes)
 
-	pollIDs := []string{"poll1", "poll2", "poll3"}
-	for {
-		select {
-		case <-ctx.Done():
-			log.Println("Simulator received shutdown signal")
-			return nil
-
-		case <-ticker.C:
-			var userID, pollID string
-			fraudCounter++
-			if fraudCounter >= fraudFrequency && lastLegitUserID != "" {
-				log.Println("generating a duplicate vote on purpose")
-				userID = lastLegitUserID
-				pollID = lastLegitPollID
-				fraudCounter = 0
-			} else {
-				pollID = pollIDs[rand.Intn(len(pollIDs))]
-				userID = fmt.Sprintf("user-%d", rand.Intn(1000))
-
-				lastLegitUserID = userID
-				lastLegitPollID = pollID
-			}
-
-			v := model.Vote{
-				PollID:    pollID,
-				UserID:    userID,
-				OptionID:  fmt.Sprintf("option-%d", rand.Intn(3)+1),
-				Timestamp: time.Now(),
-			}
-
-			publishCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-			log.Printf("Generating vote: PollID=%s, UserID=%s", v.PollID, v.UserID)
-			if err := s.eventPublisher.PublishMessage(publishCtx, v, pollID); err != nil {
-				log.Printf("Failed to publish vote: %v", err)
-			}
-			cancel()
-		}
+	for i := 0; i < s.concurrency; i++ {
+		wg.Add(1)
+		go s.worker(ctx, i+1, &wg, jobs)
 	}
+
+	log.Println("Generating vote load...")
+	for i := 0; i < s.totalVotes; i++ {
+		jobs <- struct{}{}
+	}
+	close(jobs)
+
+	wg.Wait()
+	log.Println("Stress test completed. All votes have been published")
+
+	return nil
+}
+
+func (s *Simulator) worker(ctx context.Context, id int, wg *sync.WaitGroup, jobs <-chan struct{}) {
+	defer wg.Done()
+	pollIDs := []string{"poll1", "poll2", "poll3"}
+	log.Printf("Worker %d initialized", id)
+
+	for range jobs {
+		pollID := pollIDs[rand.Intn(len(pollIDs))]
+		userID := fmt.Sprintf("user-%d", rand.Intn(10000))
+
+		vote := model.Vote{
+			PollID:    pollID,
+			UserID:    userID,
+			OptionID:  fmt.Sprintf("option-%d", rand.Intn(3)+1),
+			Timestamp: time.Now(),
+		}
+
+		publishCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		if err := s.eventPublisher.PublishMessage(publishCtx, vote, vote.PollID); err != nil {
+			log.Printf("[Worker %d] Failed to publish vote: %v", id, err)
+		}
+		cancel()
+	}
+	log.Printf("Worker %d finished", id)
 }
