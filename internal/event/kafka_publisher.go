@@ -50,7 +50,7 @@ func NewKafkaPublisher(brokers []string, topic string) (*KafkaPublisher, error) 
 	return &KafkaPublisher{writer: w}, nil
 }
 
-func (kp *KafkaPublisher) Publish(ctx context.Context, vote model.Vote, key string) error {
+func (kp *KafkaPublisher) PublishMessage(ctx context.Context, vote model.Vote, key string) error {
 	vb, err := json.Marshal(vote)
 	if err != nil {
 		return fmt.Errorf("failed to marshal vote: %v", err)

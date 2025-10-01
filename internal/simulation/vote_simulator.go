@@ -60,7 +60,7 @@ func (s *Simulator) Run(ctx context.Context) error {
 
 			publishCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 			log.Printf("Generating vote: PollID=%s, UserID=%s", v.PollID, v.UserID)
-			if err := s.eventPublisher.Publish(publishCtx, v, pollID); err != nil {
+			if err := s.eventPublisher.PublishMessage(publishCtx, v, pollID); err != nil {
 				log.Printf("Failed to publish vote: %v", err)
 			}
 			cancel()
