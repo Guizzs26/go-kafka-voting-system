@@ -7,37 +7,23 @@ import (
 	"time"
 
 	"github.com/Guizzs26/real_time_voting_analysis_system/internal/event"
+	"github.com/Guizzs26/real_time_voting_analysis_system/internal/metrics"
 	"github.com/Guizzs26/real_time_voting_analysis_system/internal/model"
 )
 
-/*
-
-A missão dele é usar a interface VoteConsumer que criamos
-para buscar os votos e aplicar nossas regras:
-
-Receber um voto.
-
-Verificar se já vimos esse par (PollID, UserID) antes.
-
-Se for novo, computar o voto e marcá-lo como "processado".
-
-Se for duplicado, descartá-lo.
-
-Periodicamente, mostrar os resultados agregados.
-
-*/
-
 type VoteProcessor struct {
 	consumer event.VoteConsumer
+	metrics  *metrics.ProcessorMetrics
 
 	mu             sync.RWMutex
-	votesProcessed map[string]map[string]bool // Estrutura: [pollID][userID] -> bool
-	results        map[string]map[string]int  // Estrutura: [pollID][optionID] -> count
+	votesProcessed map[string]map[string]bool // Structure : [pollID][userID] -> bool
+	results        map[string]map[string]int  // Structure : [pollID][optionID] -> count
 }
 
-func NewVoteProcessor(c event.VoteConsumer) *VoteProcessor {
+func NewVoteProcessor(c event.VoteConsumer, m *metrics.ProcessorMetrics) *VoteProcessor {
 	return &VoteProcessor{
 		consumer:       c,
+		metrics:        m,
 		votesProcessed: make(map[string]map[string]bool),
 		results:        make(map[string]map[string]int),
 	}
@@ -71,6 +57,12 @@ func (vp *VoteProcessor) Run(ctx context.Context) error {
 }
 
 func (vp *VoteProcessor) processVote(v model.Vote) {
+	start := time.Now()
+	defer func() {
+		durations := time.Since(start).Seconds()
+		vp.metrics.ProcessingTime.WithLabelValues(v.PollID).Observe(durations)
+	}()
+
 	vp.mu.Lock()
 	defer vp.mu.Unlock()
 
@@ -81,11 +73,13 @@ func (vp *VoteProcessor) processVote(v model.Vote) {
 
 	if vp.votesProcessed[v.PollID][v.UserID] {
 		log.Printf("[FRAUD DETECTED] Duplicate vote from UserID: %s to PollID: %s", v.UserID, v.PollID)
+		vp.metrics.VotesDuplicate.WithLabelValues(v.PollID).Inc()
 		return // we're done here
 	}
 
 	// If you've made it this far, your vote is valid
 	log.Printf("[VALID VOTE] UserID: %s voted for OptionID: %s in PollID: %s", v.UserID, v.OptionID, v.PollID)
+	vp.metrics.VotesProcessed.WithLabelValues(v.PollID).Inc()
 
 	vp.votesProcessed[v.PollID][v.UserID] = true
 	vp.results[v.PollID][v.OptionID]++
