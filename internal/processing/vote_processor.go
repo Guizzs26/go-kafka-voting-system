@@ -63,6 +63,8 @@ func (vp *VoteProcessor) processVote(v model.Vote) {
 		vp.metrics.ProcessingTime.WithLabelValues(v.PollID).Observe(durations)
 	}()
 
+	time.Sleep(50 * time.Millisecond)
+
 	vp.mu.Lock()
 	defer vp.mu.Unlock()
 
