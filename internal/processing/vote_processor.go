@@ -9,23 +9,25 @@ import (
 	"github.com/Guizzs26/real_time_voting_analysis_system/internal/event"
 	"github.com/Guizzs26/real_time_voting_analysis_system/internal/metrics"
 	"github.com/Guizzs26/real_time_voting_analysis_system/internal/model"
+	"github.com/Guizzs26/real_time_voting_analysis_system/internal/store"
 )
 
 type VoteProcessor struct {
 	consumer event.VoteConsumer
 	metrics  *metrics.ProcessorMetrics
+	store    store.VoteStore
 
-	mu             sync.RWMutex
-	votesProcessed map[string]map[string]bool // Structure : [pollID][userID] -> bool
-	results        map[string]map[string]int  // Structure : [pollID][optionID] -> count
+	// we maintain minimal, local state: just the IDs of polls we've already seen
+	mu         sync.Mutex
+	knownPolls map[string]bool
 }
 
-func NewVoteProcessor(c event.VoteConsumer, m *metrics.ProcessorMetrics) *VoteProcessor {
+func NewVoteProcessor(c event.VoteConsumer, m *metrics.ProcessorMetrics, s store.VoteStore) *VoteProcessor {
 	return &VoteProcessor{
-		consumer:       c,
-		metrics:        m,
-		votesProcessed: make(map[string]map[string]bool),
-		results:        make(map[string]map[string]int),
+		consumer:   c,
+		metrics:    m,
+		store:      s,
+		knownPolls: make(map[string]bool),
 	}
 }
 
@@ -40,7 +42,7 @@ func (vp *VoteProcessor) Run(ctx context.Context) error {
 			return nil
 
 		case <-rTicker.C:
-			vp.printResults()
+			vp.printResults(ctx)
 
 		default:
 			v, err := vp.consumer.ReadMessage(ctx)
@@ -51,56 +53,67 @@ func (vp *VoteProcessor) Run(ctx context.Context) error {
 				log.Printf("Error reading message: %v", err)
 				continue
 			}
-			vp.processVote(v)
+			vp.processVote(ctx, v)
 		}
 	}
 }
 
-func (vp *VoteProcessor) processVote(v model.Vote) {
+func (vp *VoteProcessor) processVote(ctx context.Context, v model.Vote) {
 	start := time.Now()
 	defer func() {
-		durations := time.Since(start).Seconds()
-		vp.metrics.ProcessingTime.WithLabelValues(v.PollID).Observe(durations)
+		duration := time.Since(start).Seconds()
+		vp.metrics.ProcessingTime.WithLabelValues(v.PollID).Observe(duration)
 	}()
 
-	time.Sleep(50 * time.Millisecond)
-
-	vp.mu.Lock()
-	defer vp.mu.Unlock()
-
-	if _, ok := vp.votesProcessed[v.PollID]; !ok {
-		vp.votesProcessed[v.PollID] = make(map[string]bool)
-		vp.results[v.PollID] = make(map[string]int)
+	isNewVote, err := vp.store.RegisterVote(ctx, v)
+	if err != nil {
+		log.Printf("Error registering vote: %v", err)
+		return
 	}
 
-	if vp.votesProcessed[v.PollID][v.UserID] {
+	vp.mu.Lock()
+	vp.knownPolls[v.PollID] = true
+	vp.mu.Unlock()
+
+	if !isNewVote {
 		log.Printf("[FRAUD DETECTED] Duplicate vote from UserID: %s to PollID: %s", v.UserID, v.PollID)
 		vp.metrics.VotesDuplicate.WithLabelValues(v.PollID).Inc()
 		return // we're done here
 	}
 
-	// If you've made it this far, your vote is valid
 	log.Printf("[VALID VOTE] UserID: %s voted for OptionID: %s in PollID: %s", v.UserID, v.OptionID, v.PollID)
 	vp.metrics.VotesProcessed.WithLabelValues(v.PollID).Inc()
-
-	vp.votesProcessed[v.PollID][v.UserID] = true
-	vp.results[v.PollID][v.OptionID]++
 }
 
-func (vp *VoteProcessor) printResults() {
-	vp.mu.RLock()
-	defer vp.mu.RUnlock()
+func (vp *VoteProcessor) printResults(ctx context.Context) {
+	vp.mu.Lock()
+	pollIDs := make([]string, 0, len(vp.knownPolls))
+	for id := range vp.knownPolls {
+		pollIDs = append(pollIDs, id)
+	}
+	vp.mu.Unlock()
 
-	log.Println("--- CURRENT SCORE ---")
-	if len(vp.results) == 0 {
-		log.Println("No valid votes counted yet")
+	log.Println("--- CURRENT SCORE (Redis) ---")
+	if len(pollIDs) == 0 {
+		log.Println("No polls processed yet")
+		return
 	}
 
-	for poolID, options := range vp.results {
+	for _, poolID := range pollIDs {
+		rs, err := vp.store.GetResults(ctx, poolID)
+		if err != nil {
+			log.Printf("Error getting results for PollID %s: %v", poolID, err)
+			continue
+		}
+
 		log.Printf("Poll: %s", poolID)
-		for optionID, count := range options {
-			log.Printf(" -> Option: %s | Votes: %d", optionID, count)
+		if len(rs) == 0 {
+			log.Println(" No votes counted yet")
+			continue
+		}
+		for optionID, count := range rs {
+			log.Printf(" Option %s: %d votes", optionID, count)
 		}
 	}
-	log.Println("--------------------")
+	log.Println("-----------------------------")
 }
