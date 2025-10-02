@@ -13,18 +13,25 @@ import (
 )
 
 type VoteProcessor struct {
-	consumer event.VoteConsumer
-	metrics  *metrics.ProcessorMetrics
-	store    store.VoteStore
+	consumer  event.VoteConsumer
+	publisher event.VotePublisher
+	metrics   *metrics.ProcessorMetrics
+	store     store.VoteStore
 
 	// we maintain minimal, local state: just the IDs of polls we've already seen
 	mu         sync.Mutex
 	knownPolls map[string]bool
 }
 
-func NewVoteProcessor(c event.VoteConsumer, m *metrics.ProcessorMetrics, s store.VoteStore) *VoteProcessor {
+func NewVoteProcessor(
+	c event.VoteConsumer,
+	p event.VotePublisher,
+	m *metrics.ProcessorMetrics,
+	s store.VoteStore,
+) *VoteProcessor {
 	return &VoteProcessor{
 		consumer:   c,
+		publisher:  p,
 		metrics:    m,
 		store:      s,
 		knownPolls: make(map[string]bool),
@@ -78,6 +85,13 @@ func (vp *VoteProcessor) processVote(ctx context.Context, v model.Vote) {
 	if !isNewVote {
 		log.Printf("[FRAUD DETECTED] Duplicate vote from UserID: %s to PollID: %s", v.UserID, v.PollID)
 		vp.metrics.VotesDuplicate.WithLabelValues(v.PollID).Inc()
+
+		dlqCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+
+		if err := vp.publisher.PublishMessage(dlqCtx, v, v.PollID); err != nil {
+			log.Printf("[CRITICAL ERROR] Failed to publishing to DLQ: %v", err)
+		}
 		return // we're done here
 	}
 

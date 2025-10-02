@@ -17,12 +17,13 @@ import (
 
 func main() {
 	kafkaBrokers := []string{"localhost:9092"}
-	topic := "votes"
+	votesTopic := "votes"
+	dlqTopic := "invalid_votes"
 	groupID := "vote-processor-group"
 	metricsAddr := ":8081"
 	redisAddr := "redis://localhost:6379/0"
 
-	log.Printf("Starting Consumer of topic '%s' in group '%s'...\n", topic, groupID)
+	log.Printf("Starting Consumer of topic '%s' in group '%s'...\n", votesTopic, groupID)
 
 	mainCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -35,13 +36,18 @@ func main() {
 	}
 	defer voteStore.Close()
 
-	consumer, err := event.NewKafkaConsumer(kafkaBrokers, topic, groupID)
+	publisher, err := event.NewKafkaPublisher(kafkaBrokers, dlqTopic)
+	if err != nil {
+		log.Fatalf("Error creating kafka publisher for DLQ: %v", err)
+	}
+
+	consumer, err := event.NewKafkaConsumer(kafkaBrokers, votesTopic, groupID)
 	if err != nil {
 		log.Fatalf("Error creating kafka consumer: %v", err)
 	}
 	defer consumer.Close()
 
-	processor := processing.NewVoteProcessor(consumer, appMetrics, voteStore)
+	processor := processing.NewVoteProcessor(consumer, publisher, appMetrics, voteStore)
 
 	signalChan := make(chan os.Signal, 1)
 	signal.Notify(signalChan, os.Interrupt, syscall.SIGTERM)
