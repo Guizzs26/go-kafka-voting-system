@@ -2,6 +2,7 @@ package processing
 
 import (
 	"context"
+	"encoding/json"
 	"log"
 	"sync"
 	"time"
@@ -9,6 +10,7 @@ import (
 	"github.com/Guizzs26/real_time_voting_analysis_system/internal/event"
 	"github.com/Guizzs26/real_time_voting_analysis_system/internal/metrics"
 	"github.com/Guizzs26/real_time_voting_analysis_system/internal/model"
+	"github.com/Guizzs26/real_time_voting_analysis_system/internal/pubsub"
 	"github.com/Guizzs26/real_time_voting_analysis_system/internal/store"
 )
 
@@ -17,6 +19,7 @@ type VoteProcessor struct {
 	publisher event.VotePublisher
 	metrics   *metrics.ProcessorMetrics
 	store     store.VoteStore
+	hub       *pubsub.Hub
 
 	// we maintain minimal, local state: just the IDs of polls we've already seen
 	mu         sync.Mutex
@@ -28,12 +31,14 @@ func NewVoteProcessor(
 	p event.VotePublisher,
 	m *metrics.ProcessorMetrics,
 	s store.VoteStore,
+	h *pubsub.Hub,
 ) *VoteProcessor {
 	return &VoteProcessor{
 		consumer:   c,
 		publisher:  p,
 		metrics:    m,
 		store:      s,
+		hub:        h,
 		knownPolls: make(map[string]bool),
 	}
 }
@@ -97,6 +102,31 @@ func (vp *VoteProcessor) processVote(ctx context.Context, v model.Vote) {
 
 	log.Printf("[VALID VOTE] UserID: %s voted for OptionID: %s in PollID: %s", v.UserID, v.OptionID, v.PollID)
 	vp.metrics.VotesProcessed.WithLabelValues(v.PollID).Inc()
+
+	r, err := vp.store.GetResults(ctx, v.PollID)
+	if err != nil {
+		log.Printf("Error getting results for PollID %s: %v", v.PollID, err)
+		return
+	}
+
+	rJSON, err := json.Marshal(r)
+	if err != nil {
+		log.Printf("Error marshalling vote to JSON: %v", err)
+		return
+	}
+
+	m := &pubsub.Message{
+		PollID: v.PollID,
+		Data:   rJSON,
+	}
+
+	select {
+	case vp.hub.Broadcast <- m:
+		// message sent successfully
+		log.Printf("Poll score %s sent to Hub.", v.PollID)
+	default:
+		log.Printf("Warning: Broadcast channel is full, dropping message for PollID: %s", v.PollID)
+	}
 }
 
 func (vp *VoteProcessor) printResults(ctx context.Context) {
