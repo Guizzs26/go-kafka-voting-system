@@ -3,6 +3,8 @@ package processing
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"log"
 	"sync"
 	"time"
@@ -15,11 +17,13 @@ import (
 )
 
 type VoteProcessor struct {
-	consumer  event.VoteConsumer
-	publisher event.VotePublisher
-	metrics   *metrics.ProcessorMetrics
-	store     store.VoteStore
-	hub       *pubsub.Hub
+	consumer   event.VoteConsumer
+	publisher  event.VotePublisher
+	metrics    *metrics.ProcessorMetrics
+	store      store.VoteStore
+	hub        *pubsub.Hub
+	numWorkers int
+	wg         sync.WaitGroup
 
 	// we maintain minimal, local state: just the IDs of polls we've already seen
 	mu         sync.Mutex
@@ -32,6 +36,7 @@ func NewVoteProcessor(
 	m *metrics.ProcessorMetrics,
 	s store.VoteStore,
 	h *pubsub.Hub,
+	nw int,
 ) *VoteProcessor {
 	return &VoteProcessor{
 		consumer:   c,
@@ -39,6 +44,7 @@ func NewVoteProcessor(
 		metrics:    m,
 		store:      s,
 		hub:        h,
+		numWorkers: nw,
 		knownPolls: make(map[string]bool),
 	}
 }
@@ -47,27 +53,55 @@ func (vp *VoteProcessor) Run(ctx context.Context) error {
 	rTicker := time.NewTicker(5 * time.Second)
 	defer rTicker.Stop()
 
-	for {
-		select {
-		case <-ctx.Done():
-			log.Println("Vote processor receiving signal to stop.")
-			return nil
+	jobs := make(chan model.Vote, 100)
+	for i := 1; i < vp.numWorkers; i++ {
+		vp.wg.Add(1)
+		go vp.worker(ctx, i+1, jobs)
+	}
 
-		case <-rTicker.C:
-			vp.printResults(ctx)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				log.Println("Message reader got stop signal")
+				close(jobs)
+				return
 
-		default:
-			v, err := vp.consumer.ReadMessage(ctx)
-			if err != nil {
-				if ctx.Err() == context.Canceled {
+			default:
+				v, err := vp.consumer.ReadMessage(ctx)
+				if err != nil {
+					if errors.Is(err, context.Canceled) || errors.Is(err, io.EOF) {
+						continue
+					}
+					log.Printf("Error reading message from kafka: %v", err)
 					continue
 				}
-				log.Printf("Error reading message: %v", err)
-				continue
+				jobs <- v
 			}
-			vp.processVote(ctx, v)
 		}
-	}
+	}()
+
+	resultsTicker := time.NewTicker(5 * time.Second)
+	defer resultsTicker.Stop()
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				log.Println("Results reporter got stop signal")
+				return
+			case <-resultsTicker.C:
+				vp.printResults(ctx)
+			}
+		}
+	}()
+
+	log.Println("Vote processor and workers started")
+	<-ctx.Done()
+	log.Println("Vote processor shutting down, waiting for workers...")
+
+	vp.wg.Wait()
+	log.Println("All workers finished")
+	return nil
 }
 
 func (vp *VoteProcessor) processVote(ctx context.Context, v model.Vote) {
@@ -160,4 +194,15 @@ func (vp *VoteProcessor) printResults(ctx context.Context) {
 		}
 	}
 	log.Println("-----------------------------")
+}
+
+func (vp *VoteProcessor) worker(ctx context.Context, id int, jobs <-chan model.Vote) {
+	defer vp.wg.Done()
+	log.Printf("Worker %d started", id)
+
+	for vote := range jobs {
+		vp.processVote(ctx, vote)
+	}
+
+	log.Printf("Worker %d finished", id)
 }

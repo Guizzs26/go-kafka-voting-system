@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 
 	"github.com/Guizzs26/real_time_voting_analysis_system/internal/event"
@@ -24,6 +25,7 @@ func main() {
 	groupID := "vote-processor-group"
 	metricsAddr := ":8081"
 	redisAddr := "redis://localhost:6379/0"
+	numWorkers := runtime.NumCPU()
 
 	hub := pubsub.NewHub()
 	go hub.Run()
@@ -52,7 +54,7 @@ func main() {
 	}
 	defer consumer.Close()
 
-	processor := processing.NewVoteProcessor(consumer, publisher, appMetrics, voteStore, hub)
+	processor := processing.NewVoteProcessor(consumer, publisher, appMetrics, voteStore, hub, numWorkers)
 
 	signalChan := make(chan os.Signal, 1)
 	signal.Notify(signalChan, os.Interrupt, syscall.SIGTERM)
